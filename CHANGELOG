@@ -1,3 +1,83 @@
+## Version 2.1.1 - Changelog
+
+### Fix
+
+- **Invoice total not refreshed via Recalculate / apply-on-save.** `updateInvoiceTotal()`
+  is not loaded in the admin addon page context, so the fee line was written but the
+  stored invoice total stayed stale. The helper is now loaded on demand, plus a
+  safety net recomputes the total from the line items for tax-free invoices. Verified
+  on WHMCS (Dev License): a -10% discount on a $200 invoice now correctly yields $180.
+
+---
+
+## Version 2.1 - Changelog
+
+### New Features
+
+1. **Discounts** — negative fixed/percentage values are now allowed and shown as
+   a "Discount" line on the invoice.
+2. **Minimum threshold & maximum cap** — per gateway, apply a fee only when the
+   invoice base reaches a minimum, and/or cap the fee at a maximum amount.
+3. **Configurable percentage base** — apply the percentage to the item subtotal
+   (excl. tax) or to the subtotal plus estimated tax.
+4. **Client-group exemptions** — comma-separated client group IDs that are never
+   charged a fee.
+5. **Overview panel** — the admin page now shows how many unpaid invoices carry a
+   fee and the total of those fees.
+6. **"Apply to existing unpaid invoices"** checkbox on Save.
+7. **Activity Log** — optional log entry each time a fee is applied.
+8. **Internationalisation** — all interface strings moved to `lang/english.php`.
+
+### Fixes & Improvements
+
+9. **Admin-created invoices** — re-registered the `InvoiceCreationAdminArea` /
+   `InvoiceCreation` hooks so fees apply to manually created invoices again.
+10. **Partial payments** — invoices that already have recorded transactions are
+    left untouched to avoid corrupting a paid/partial balance.
+11. **Checkout estimate alignment** — the checkout JavaScript now mirrors the
+    server-side rules (min threshold, max cap, discounts).
+12. **View/logic separation** — the admin interface now renders from a dedicated
+    template (`templates/manage.tpl.php`).
+
+---
+
+## Version 2.0 - Changelog
+
+### WHMCS 9.x Compatibility & Major Rewrite
+
+1. **WHMCS 9.x / PHP 8.1+ compatibility**:
+   - Removed the fragile, hand-rolled reimplementation of WHMCS' internal
+     invoice/tax calculation (which relied on `$CONFIG`, `clientfunctions.php`,
+     `getClientsDetails` and `format_as_currency`).
+   - Added null-safety throughout so a missing gateway or invoice no longer
+     triggers fatal errors under PHP 8.
+
+2. **New admin management interface** (`_output`):
+   - Per-gateway fees are now managed from a dedicated addon page with a clean
+     table UI instead of dozens of auto-generated config fields.
+   - Enable/disable each gateway individually, set a fixed amount and/or a
+     percentage, and save in one place.
+   - One-click "Recalculate Unpaid Invoices" maintenance action.
+
+3. **Dedicated database table** (`mod_gateway_fees`):
+   - Fee rules are stored in their own table (created on activation) instead of
+     abusing `tbladdonmodules`.
+   - Automatic migration of legacy 1.x `fee_1_*` / `fee_2_*` settings on upgrade.
+
+4. **Proper module lifecycle**:
+   - `_activate` now returns a status array and creates the storage table.
+   - Added `_deactivate` (preserves data) and `_upgrade` (migrates legacy data).
+
+5. **Safer hooks**:
+   - All hook functions are now prefixed (`gatewayfees_*`) to avoid global
+     collisions.
+   - Percentage fees are applied to the invoice item subtotal (excluding any
+     existing gateway fee line), giving deterministic, version-safe results.
+   - Configurable fee label (previously hardcoded as "VAT") and optional taxing
+     of the fee line.
+
+---
+
 ## Version 1.2 - Changelog
 
 ### Updates and Improvements

@@ -1,335 +1,495 @@
 <?php
 
+/**
+ * WHMCS Gateway Fees Addon — Hooks
+ *
+ * Applies the configured per-gateway fee to invoices and (optionally) shows an
+ * estimate on the checkout page.
+ *
+ * Compatible with WHMCS 9.x / PHP 8.1+.
+ *
+ * @package    WHMCS\Addon\GatewayFees
+ * @author     Nikba Creative Studio
+ * @license    MIT
+ */
+
+if (!defined('WHMCS')) {
+    die('This file cannot be accessed directly');
+}
+
 use WHMCS\Database\Capsule;
 
+if (!defined('GATEWAY_FEES_TABLE')) {
+    define('GATEWAY_FEES_TABLE', 'mod_gateway_fees');
+}
+
 /**
- * Function to update the gateway fee for a specific invoice.
+ * Read an addon global setting from tbladdonmodules.
+ *
+ * @param string $setting
+ * @param mixed  $default
+ * @return mixed
+ */
+function gatewayfees_setting($setting, $default = null)
+{
+    $value = Capsule::table('tbladdonmodules')
+        ->where('module', 'gateway_fees')
+        ->where('setting', $setting)
+        ->value('value');
+
+    return ($value === null || $value === '') ? $default : $value;
+}
+
+/**
+ * Fetch the fee rule for a gateway.
+ *
+ * @param string $gateway
+ * @return object|null
+ */
+function gatewayfees_get_rule($gateway)
+{
+    if (empty($gateway) || !Capsule::schema()->hasTable(GATEWAY_FEES_TABLE)) {
+        return null;
+    }
+
+    return Capsule::table(GATEWAY_FEES_TABLE)
+        ->where('gateway', $gateway)
+        ->where('enabled', 1)
+        ->first();
+}
+
+/**
+ * Resolve the friendly display name of a gateway (null-safe).
+ *
+ * @param string $gateway
+ * @return string
+ */
+function gatewayfees_gateway_name($gateway)
+{
+    $name = Capsule::table('tblpaymentgateways')
+        ->where('gateway', $gateway)
+        ->where('setting', 'name')
+        ->value('value');
+
+    return $name ?: ucfirst((string) $gateway);
+}
+
+/**
+ * Determine whether an invoice already has recorded payments/transactions.
+ * We never alter such invoices to avoid corrupting a paid/partial balance.
+ *
+ * @param int $invoiceId
+ * @return bool
+ */
+function gatewayfees_has_payments($invoiceId)
+{
+    return Capsule::table('tblaccounts')
+        ->where('invoiceid', $invoiceId)
+        ->exists();
+}
+
+/**
+ * Check whether a client belongs to a fee-exempt group.
+ *
+ * @param int $userid
+ * @return bool
+ */
+function gatewayfees_is_exempt($userid)
+{
+    $raw = trim((string) gatewayfees_setting('exempt_groups', ''));
+    if ($raw === '') {
+        return false;
+    }
+
+    $exempt = array_filter(array_map('trim', explode(',', $raw)), 'strlen');
+    if (!$exempt) {
+        return false;
+    }
+
+    $groupId = Capsule::table('tblclients')->where('id', $userid)->value('groupid');
+
+    return in_array((string) $groupId, $exempt, true);
+}
+
+/**
+ * Compute the base amount a percentage fee is applied to.
+ *
+ * @param object $invoice
+ * @return float
+ */
+function gatewayfees_base_amount($invoice)
+{
+    $items = Capsule::table('tblinvoiceitems')
+        ->where('invoiceid', $invoice->id)
+        ->where('notes', '!=', 'gateway_fees')
+        ->get();
+
+    $subtotal      = 0.0;
+    $taxedSubtotal = 0.0;
+    foreach ($items as $item) {
+        $subtotal += (float) $item->amount;
+        if ((int) $item->taxed === 1) {
+            $taxedSubtotal += (float) $item->amount;
+        }
+    }
+
+    if (gatewayfees_setting('fee_base', 'subtotal') !== 'total') {
+        return $subtotal;
+    }
+
+    // "Total incl. tax" mode: add a simple, non-compound tax estimate.
+    $tax = 0.0;
+    if ($taxedSubtotal > 0) {
+        $tax += $taxedSubtotal * ((float) $invoice->taxrate / 100);
+        $tax += $taxedSubtotal * ((float) $invoice->taxrate2 / 100);
+    }
+
+    return $subtotal + $tax;
+}
+
+/**
+ * Calculate the signed fee amount for a rule against a base value.
+ * Supports fixed + percentage, negative values (discounts), a minimum invoice
+ * threshold and a maximum fee cap.
+ *
+ * @param object $rule
+ * @param float  $base
+ * @return float
+ */
+function gatewayfees_calculate($rule, $base)
+{
+    $minAmount = (float) ($rule->min_amount ?? 0);
+    if ($minAmount > 0 && $base < $minAmount) {
+        return 0.0;
+    }
+
+    $fee = (float) $rule->fee_fixed + ($base * (float) $rule->fee_percent / 100);
+
+    $maxFee = (float) ($rule->max_fee ?? 0);
+    if ($maxFee > 0 && abs($fee) > $maxFee) {
+        $fee = ($fee < 0 ? -1 : 1) * $maxFee;
+    }
+
+    return round($fee, 2);
+}
+
+/**
+ * Apply / refresh the gateway fee on a single invoice.
  *
  * @param array $vars
+ * @return void
  */
-function update_gateway_fee($vars)
+function gatewayfees_update_invoice($vars)
 {
-    $id = $vars['invoiceid'];
-    $invoice = Capsule::table('tblinvoices')->where('id', $id)->first();
+    $invoiceId = $vars['invoiceid'] ?? null;
+    if (!$invoiceId) {
+        return;
+    }
 
+    $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
     if (!$invoice) {
         return;
     }
 
-    $paymentmethod = $invoice->paymentmethod;
-    // Delete existing gateway fee items from the invoice
-    Capsule::table('tblinvoiceitems')->where('invoiceid', $id)->where('notes', 'gateway_fees')->delete();
-
-    // Retrieve fee settings for the specific payment method
-    $results = Capsule::table('tbladdonmodules')
-        ->where('setting', 'like', 'fee_2_' . $paymentmethod)
-        ->orWhere('setting', 'like', 'fee_1_' . $paymentmethod)
-        ->get();
-
-    $params = [];
-    foreach ($results as $result) {
-        $params[$result->setting] = $result->value;
+    // Never touch invoices that already carry payments (paid or partial).
+    if (gatewayfees_has_payments($invoiceId)) {
+        return;
     }
 
-    $fee1 = $params['fee_1_' . $paymentmethod] ?? 0;
-    $fee2 = $params['fee_2_' . $paymentmethod] ?? 0;
-    $total = InvoiceTotal($id);
-    $amountdue = 0;
-    if ($total > 0) {
-        $amountdue = $fee1 + $total * $fee2 / 100;
+    // Always remove the previous fee line first so we never stack fees.
+    Capsule::table('tblinvoiceitems')
+        ->where('invoiceid', $invoiceId)
+        ->where('notes', 'gateway_fees')
+        ->delete();
+
+    // Exempt client groups get no fee at all.
+    if (gatewayfees_is_exempt($invoice->userid)) {
+        gatewayfees_recalc_total($invoiceId);
+        return;
     }
 
-    // Add gateway fee item to the invoice if applicable
-    if ($amountdue > 0) {
-        $userid = $invoice->userid;
-        $description = getGatewayName2($paymentmethod) . " VAT (Fee: " . ($fee1 > 0 ? $fee1 : '') . ($fee2 > 0 ? "+" . $fee2 . "%" : "") . ")";
+    $rule = gatewayfees_get_rule($invoice->paymentmethod);
+    if (!$rule) {
+        gatewayfees_recalc_total($invoiceId);
+        return;
+    }
+
+    $base      = gatewayfees_base_amount($invoice);
+    $feeAmount = gatewayfees_calculate($rule, $base);
+
+    if ($feeAmount != 0.0 && $base > 0) {
+        $taxed       = gatewayfees_setting('tax_fees', 'off') === 'on' ? 1 : 0;
+        $description  = gatewayfees_build_description($invoice->paymentmethod, $rule, $feeAmount);
+
         Capsule::table('tblinvoiceitems')->insert([
-            "userid" => $userid,
-            "invoiceid" => $id,
-            "type" => "Fee",
-            "notes" => "gateway_fees",
-            "description" => $description,
-            "amount" => $amountdue,
-            "taxed" => "0",
-            "duedate" => date('Y-m-d'),
-            "paymentmethod" => $paymentmethod
+            'userid'        => $invoice->userid,
+            'invoiceid'     => $invoiceId,
+            'type'          => 'Fee',
+            'notes'         => 'gateway_fees',
+            'description'   => $description,
+            'amount'        => $feeAmount,
+            'taxed'         => $taxed,
+            'duedate'       => date('Y-m-d'),
+            'paymentmethod' => $invoice->paymentmethod,
         ]);
+
+        if (gatewayfees_setting('log_activity', 'off') === 'on' && function_exists('logActivity')) {
+            logActivity(
+                'Gateway Fees: applied ' . number_format($feeAmount, 2)
+                . ' to Invoice #' . $invoiceId . ' (' . $invoice->paymentmethod . ')',
+                $invoice->userid
+            );
+        }
     }
-    updateInvoiceTotal($id);
+
+    gatewayfees_recalc_total($invoiceId);
 }
 
 /**
- * Function to update the gateway fee for all unpaid invoices of a specific client.
+ * Build the invoice line-item description (handles discounts).
  *
- * @param int $userid
- * @param string $newPaymentMethod
+ * @param string $gateway
+ * @param object $rule
+ * @param float  $feeAmount
+ * @return string
  */
-function update_gateway_fee_for_client($userid, $newPaymentMethod)
+function gatewayfees_build_description($gateway, $rule, $feeAmount)
 {
-    // Update all unpaid invoices for the client with the new payment method
+    $label     = gatewayfees_setting('fee_label', 'Gateway Fee');
+    $feeFixed   = (float) $rule->fee_fixed;
+    $feePercent = (float) $rule->fee_percent;
+
+    $parts = [];
+    if ($feeFixed != 0.0) {
+        $parts[] = number_format($feeFixed, 2);
+    }
+    if ($feePercent != 0.0) {
+        $parts[] = rtrim(rtrim(number_format($feePercent, 4, '.', ''), '0'), '.') . '%';
+    }
+    $breakdown = $parts ? ' (' . implode(' + ', $parts) . ')' : '';
+
+    if ($feeAmount < 0) {
+        $label = 'Discount';
+    }
+
+    return gatewayfees_gateway_name($gateway) . ' ' . $label . $breakdown;
+}
+
+/**
+ * Recalculate and persist the invoice total using WHMCS' own helper.
+ *
+ * updateInvoiceTotal() lives in includes/invoicefunctions.php, which is loaded
+ * automatically in the billing/hook context but NOT when this runs from the
+ * admin addon page (Recalculate). Load it on demand so totals are always
+ * refreshed regardless of the calling context.
+ *
+ * @param int $invoiceId
+ * @return void
+ */
+function gatewayfees_recalc_total($invoiceId)
+{
+    // Load WHMCS' own helper (best tax accuracy). It lives in
+    // includes/invoicefunctions.php, loaded automatically in the billing/hook
+    // context but NOT when this runs from the admin addon page (Recalculate).
+    if (!function_exists('updateInvoiceTotal')) {
+        $root = defined('ROOTDIR') ? ROOTDIR : dirname(__DIR__, 3);
+        $path = $root . '/includes/invoicefunctions.php';
+        if (is_file($path)) {
+            require_once $path;
+        }
+    }
+
+    if (function_exists('updateInvoiceTotal')) {
+        updateInvoiceTotal($invoiceId);
+    }
+
+    // Safety net: in some contexts the helper is unavailable or a no-op, which
+    // leaves the stored total stale after we change a line item. For invoices
+    // with no tax the correct total is unambiguous (sum of items minus credit),
+    // so force it when it does not match. Taxed invoices are left to WHMCS.
+    $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+    if (!$invoice) {
+        return;
+    }
+
+    if ((float) $invoice->taxrate == 0.0 && (float) $invoice->taxrate2 == 0.0) {
+        $subtotal = (float) Capsule::table('tblinvoiceitems')
+            ->where('invoiceid', $invoiceId)
+            ->sum('amount');
+        $total = round(max(0, $subtotal - (float) $invoice->credit), 2);
+
+        if (round((float) $invoice->total, 2) !== $total) {
+            Capsule::table('tblinvoices')->where('id', $invoiceId)->update([
+                'subtotal' => round($subtotal, 2),
+                'total'    => $total,
+            ]);
+        }
+    }
+}
+
+/**
+ * Re-apply fees to every unpaid invoice of a client (used when the client's
+ * default payment method changes).
+ *
+ * @param int    $userid
+ * @param string $newPaymentMethod
+ * @return void
+ */
+function gatewayfees_update_client_invoices($userid, $newPaymentMethod)
+{
+    if (empty($userid)) {
+        return;
+    }
+
     $invoices = Capsule::table('tblinvoices')
         ->where('userid', $userid)
         ->where('status', 'Unpaid')
-        ->get();
+        ->pluck('id');
 
-    foreach ($invoices as $invoice) {
-        Capsule::table('tblinvoices')
-            ->where('id', $invoice->id)
-            ->update(['paymentmethod' => $newPaymentMethod]);
-
-        update_gateway_fee(['invoiceid' => $invoice->id]);
+    foreach ($invoices as $invoiceId) {
+        if (!empty($newPaymentMethod)) {
+            Capsule::table('tblinvoices')
+                ->where('id', $invoiceId)
+                ->update(['paymentmethod' => $newPaymentMethod]);
+        }
+        gatewayfees_update_invoice(['invoiceid' => $invoiceId]);
     }
 }
 
-// Register hooks
-add_hook("InvoiceCreationPreEmail", 1, "update_gateway_fee");
-add_hook("InvoiceChangeGateway", 1, "update_gateway_fee");
-add_hook("InvoiceCreated", 1, "update_gateway_fee");
-add_hook("InvoiceCreationAdminArea", 1, "update_gateway_fee");
-add_hook("InvoiceCreation", 1, "update_gateway_fee");
+/* -------------------------------------------------------------------------
+ * Hook registrations
+ * ---------------------------------------------------------------------- */
 
-add_hook("ClientChangePaymentMethod", 1, function($vars) {
-    $userid = $vars['userid'];
-    $newPaymentMethod = $vars['newpaymentmethod'];
-    update_gateway_fee_for_client($userid, $newPaymentMethod);
+// The fee function is idempotent (it removes the previous gateway_fees line
+// before re-adding), so registering on every relevant hook is safe and never
+// stacks fees. InvoiceCreationAdminArea is what fires on manual admin creation.
+add_hook('InvoiceCreation', 1, 'gatewayfees_update_invoice');
+add_hook('InvoiceCreationAdminArea', 1, 'gatewayfees_update_invoice');
+add_hook('InvoiceCreationPreEmail', 1, 'gatewayfees_update_invoice');
+add_hook('InvoiceCreated', 1, 'gatewayfees_update_invoice');
+add_hook('InvoiceChangeGateway', 1, 'gatewayfees_update_invoice');
+
+add_hook('ClientChangePaymentMethod', 1, function ($vars) {
+    gatewayfees_update_client_invoices(
+        $vars['userid'] ?? null,
+        $vars['newpaymentmethod'] ?? ''
+    );
 });
 
-add_hook('AdminClientProfileTabFieldsSave', 1, function($vars) {
-    $userid = $vars['userid'];
-    $newPaymentMethod = Capsule::table('tblclients')->where('id', $userid)->value('defaultgateway');
-    update_gateway_fee_for_client($userid, $newPaymentMethod);
+add_hook('AdminClientProfileTabFieldsSave', 1, function ($vars) {
+    $userid = $vars['userid'] ?? null;
+    if (!$userid) {
+        return;
+    }
+    $newPaymentMethod = Capsule::table('tblclients')
+        ->where('id', $userid)
+        ->value('defaultgateway');
+    gatewayfees_update_client_invoices($userid, (string) $newPaymentMethod);
 });
 
 /**
- * Function to calculate the total amount of an invoice.
- *
- * @param int $id
- * @return float
- */
-function InvoiceTotal($id)
-{
-    global $CONFIG;
-    $invoiceItems = Capsule::table('tblinvoiceitems')->where('invoiceid', $id)->get();
-
-    $taxsubtotal = 0;
-    $nontaxsubtotal = 0;
-    foreach ($invoiceItems as $item) {
-        if ($item->taxed == "1") {
-            $taxsubtotal += $item->amount;
-        } else {
-            $nontaxsubtotal += $item->amount;
-        }
-    }
-
-    $subtotal = $total = $nontaxsubtotal + $taxsubtotal;
-    $invoice = Capsule::table('tblinvoices')->where('id', $id)->first();
-    $userid = $invoice->userid;
-    $credit = $invoice->credit;
-    $taxrate = $invoice->taxrate;
-    $taxrate2 = $invoice->taxrate2;
-
-    if (!function_exists("getClientsDetails")) {
-        require_once (dirname(__FILE__) . "/clientfunctions.php");
-    }
-
-    $clientsdetails = getClientsDetails($userid);
-    $tax = $tax2 = 0;
-    if ($CONFIG['TaxEnabled'] == "on" && !$clientsdetails['taxexempt']) {
-        if ($taxrate != "0.00") {
-            if ($CONFIG['TaxType'] == "Inclusive") {
-                $taxrate = $taxrate / 100 + 1;
-                $calc1 = $taxsubtotal / $taxrate;
-                $tax = $taxsubtotal - $calc1;
-            } else {
-                $taxrate = $taxrate / 100;
-                $tax = $taxsubtotal * $taxrate;
-            }
-        }
-
-        if ($taxrate2 != "0.00") {
-            if ($CONFIG['TaxL2Compound']) {
-                $taxsubtotal += $tax;
-            }
-
-            if ($CONFIG['TaxType'] == "Inclusive") {
-                $taxrate2 = $taxrate2 / 100 + 1;
-                $calc1 = $taxsubtotal / $taxrate2;
-                $tax2 = $taxsubtotal - $calc1;
-            } else {
-                $taxrate2 = $taxrate2 / 100;
-                $tax2 = $taxsubtotal * $taxrate2;
-            }
-        }
-
-        $tax = round($tax, 2);
-        $tax2 = round($tax2, 2);
-    }
-
-    if ($CONFIG['TaxType'] == "Inclusive") {
-        $subtotal = $subtotal - $tax - $tax2;
-    } else {
-        $total = $subtotal + $tax + $tax2;
-    }
-
-    if (0 < $credit) {
-        if ($total < $credit) {
-            $total = 0;
-        } else {
-            $total -= $credit;
-        }
-    }
-
-    $subtotal = format_as_currency($subtotal);
-    $tax = format_as_currency($tax);
-    $total = format_as_currency($total);
-    return $total;
-}
-
-/**
- * Function to get the friendly name of a payment gateway.
- *
- * @param string $modulename
- * @return string
- */
-function getGatewayName2($modulename)
-{
-    $result = Capsule::table('tblpaymentgateways')->where('gateway', $modulename)->where('setting', 'name')->first();
-    return $result->value;
-}
-
-/**
- * Hook to apply and display gateway fees on the checkout page based on selected payment method.
+ * Display an estimated fee on the checkout page (Twenty-One theme).
+ * The JS mirrors the server-side rules (fixed + %, min threshold, max cap,
+ * discounts) so the estimate matches what will land on the invoice.
  */
 add_hook('ShoppingCartCheckoutOutput', 1, function ($vars) {
-    // Check if the hook is enabled in the module settings
-    $enabled = Capsule::table('tbladdonmodules')
-        ->where('module', 'gateway_fees')
-        ->where('setting', 'enable_checkout_hook')
-        ->value('value');
-
-    if ($enabled !== 'on') {
-        return; // Do not inject anything if the hook is disabled
+    if (gatewayfees_setting('enable_checkout_hook', 'off') !== 'on') {
+        return '';
     }
 
-    // Get Current user currency
-    $currency = getCurrency();
-    
-    if($currency) {
-        $currencySymbol = $currency['code'];
+    if (!Capsule::schema()->hasTable(GATEWAY_FEES_TABLE)) {
+        return '';
     }
-    else {
-        // Get the system currency
+
+    // Current display currency.
+    $currencySymbol = '';
+    if (function_exists('getCurrency')) {
+        $currency = getCurrency();
+        if (!empty($currency['code'])) {
+            $currencySymbol = $currency['code'];
+        }
+    }
+    if (!$currencySymbol) {
         $currencySymbol = Capsule::table('tblcurrencies')
             ->where('default', 1)
             ->value('code');
     }
-    // Get the system currency
-    
+    $currencySymbol = htmlspecialchars((string) $currencySymbol, ENT_QUOTES);
+    $feeLabel       = htmlspecialchars((string) gatewayfees_setting('fee_label', 'Gateway Fee'), ENT_QUOTES);
 
-    // Get all payment methods and their corresponding fees
-    $paymentMethods = Capsule::table('tblpaymentgateways')
-        ->select('gateway')
-        ->groupBy('gateway')
-        ->get();
-
-    $fees = [];
-    foreach ($paymentMethods as $method) {
-        $fee1 = Capsule::table('tbladdonmodules')
-            ->where('module', 'gateway_fees')
-            ->where('setting', 'fee_1_' . $method->gateway)
-            ->value('value');
-
-        $fee2 = Capsule::table('tbladdonmodules')
-            ->where('module', 'gateway_fees')
-            ->where('setting', 'fee_2_' . $method->gateway)
-            ->value('value');
-
-        $fees[$method->gateway] = [
-            'fee1' => (float)$fee1,
-            'fee2' => (float)$fee2,
+    // Build the fee map for enabled gateways.
+    $rules = Capsule::table(GATEWAY_FEES_TABLE)->where('enabled', 1)->get();
+    $fees  = [];
+    foreach ($rules as $rule) {
+        $fees[$rule->gateway] = [
+            'fixed'   => (float) $rule->fee_fixed,
+            'percent' => (float) $rule->fee_percent,
+            'min'     => (float) ($rule->min_amount ?? 0),
+            'max'     => (float) ($rule->max_fee ?? 0),
         ];
     }
 
-    // Convert PHP array to JSON for use in JavaScript
     $feesJson = json_encode($fees);
 
-    // Inject HTML and JavaScript
-    $script = <<<EOT
+    return <<<EOT
     <script>
         document.addEventListener('DOMContentLoaded', function () {
-            // Inject the Gateway Fee and Total with Fee elements into the page
-            var feeRow = '<div id="gatewayFeeRow">' +
-                         'Gateway Fee: ' +
-                         '<strong id="gatewayFee">0.00</strong> <strong> $currencySymbol </strong>' +
-                         '</div>';
-            var totalWithFeeRow = '<div id="totalWithFeeRow">' +
-                                  'Total with Fee: ' +
-                                  '<strong id="totalWithFee">0.00</strong> <strong> $currencySymbol </strong>' +
-                                  '</div>';
-                                  
+            var fees = {$feesJson};
+            var currency = "{$currencySymbol}";
+            var label = "{$feeLabel}";
+
+            var feeRow = '<div id="gatewayFeeRow">' + label + ': ' +
+                         '<strong id="gatewayFee">0.00</strong> <strong>' + currency + '</strong></div>';
+            var totalWithFeeRow = '<div id="totalWithFeeRow">Total with ' + label + ': ' +
+                         '<strong id="totalWithFee">0.00</strong> <strong>' + currency + '</strong></div>';
+
             var checkoutSummary = document.getElementById('checkoutSummary');
             if (checkoutSummary) {
-                checkoutSummary.insertAdjacentHTML('beforeend', feeRow);
-                checkoutSummary.insertAdjacentHTML('beforeend', totalWithFeeRow);
+                checkoutSummary.insertAdjacentHTML('beforeend', feeRow + totalWithFeeRow);
             } else {
-                // Fallback: insert after totalCartPrice element or another valid element
                 var totalCartPriceElement = document.getElementById('totalCartPrice');
                 if (totalCartPriceElement) {
                     totalCartPriceElement.insertAdjacentHTML('afterend', feeRow + totalWithFeeRow);
                 }
             }
 
-            // Define the fee structure dynamically from the backend
-            var fees = $feesJson;
+            function computeFee(rule, base) {
+                if (rule.min > 0 && base < rule.min) { return 0; }
+                var fee = rule.fixed + (base * rule.percent / 100);
+                if (rule.max > 0 && Math.abs(fee) > rule.max) {
+                    fee = (fee < 0 ? -1 : 1) * rule.max;
+                }
+                return fee;
+            }
 
-            // Function to update the fee and total
             function updateGatewayFee() {
-                // Get the selected payment method
-                var selectedPaymentMethod = document.querySelector('input[name="paymentmethod"]:checked').value;
+                var selected = document.querySelector('input[name="paymentmethod"]:checked');
+                if (!selected) { return; }
+                var rule = fees[selected.value];
 
-                // Get the fees for the selected payment method
-                var fee1 = fees[selectedPaymentMethod]?.fee1 || 0;
-                var fee2 = fees[selectedPaymentMethod]?.fee2 || 0;
-
-                // Get the current subtotal from the element with id 'totalCartPrice'
                 var subtotalElement = document.getElementById('totalCartPrice');
-                var subtotal = parseFloat(subtotalElement ? subtotalElement.textContent.replace(/[^\d.-]/g, '') : 0);
+                var subtotal = parseFloat(subtotalElement ? subtotalElement.textContent.replace(/[^\d.-]/g, '') : 0) || 0;
 
-                // Calculate the fee
-                var gatewayFee = fee1 + (subtotal * fee2 / 100);
-
-                // Calculate the new total including the fee
+                var gatewayFee = rule ? computeFee(rule, subtotal) : 0;
                 var totalWithFee = subtotal + gatewayFee;
 
-                // Update the page with the fee and total
-                document.getElementById('gatewayFee').textContent = gatewayFee.toFixed(2);
-                document.getElementById('totalWithFee').textContent = totalWithFee.toFixed(2);
+                var feeEl = document.getElementById('gatewayFee');
+                var totalEl = document.getElementById('totalWithFee');
+                if (feeEl) { feeEl.textContent = gatewayFee.toFixed(2); }
+                if (totalEl) { totalEl.textContent = totalWithFee.toFixed(2); }
             }
 
-            // Attach event listener to payment method radio buttons
             var paymentMethods = document.querySelectorAll('input[name="paymentmethod"]');
-
-            // Use iCheck events if available
             if (window.jQuery && jQuery().iCheck) {
-                jQuery(paymentMethods).on('ifChecked', function() {
-                    updateGatewayFee();
-                });
+                jQuery(paymentMethods).on('ifChecked', updateGatewayFee);
             } else {
-                // Fallback to regular events
-                paymentMethods.forEach(function (method) {
-                    method.addEventListener('change', updateGatewayFee);
-                    method.addEventListener('click', updateGatewayFee);
+                paymentMethods.forEach(function (m) {
+                    m.addEventListener('change', updateGatewayFee);
+                    m.addEventListener('click', updateGatewayFee);
                 });
             }
-
-            // Run update on page load in case a payment method is already selected
             updateGatewayFee();
         });
     </script>
     EOT;
-
-    return $script;
 });
-
-
-?>
