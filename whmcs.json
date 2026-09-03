@@ -7,11 +7,16 @@
     "description": {
       "name": "Gateway Fees",
       "tagline": "Add fees based on the gateway being used.",
-      "long": "This WHMCS addon allows you to add fees based on the payment gateway being used. It supports applying fees to invoices, updating fees when payment methods are changed, and handling changes made by both clients and administrators.",
+      "long": "This WHMCS addon allows you to add fees (or discounts) based on the payment gateway being used. It supports fixed and percentage fees, minimum thresholds and maximum caps, client-group exemptions, a configurable percentage base, and handling changes made by both clients and administrators. Version 2.1.1 is fully compatible with WHMCS 9.x and ships with a dedicated admin management interface.",
       "features": [
-        "Add fixed and percentage-based fees for each payment gateway.",
-        "Automatically apply fees to invoices when they are created or updated.",
-        "Update fees when the payment method is changed by the client or administrator."
+        "Fixed and percentage-based fees — or discounts (negative values) — per gateway.",
+        "Minimum invoice threshold and maximum fee cap per gateway.",
+        "Configurable percentage base (item subtotal or total incl. tax).",
+        "Exempt selected client groups from fees.",
+        "Full admin management interface with overview stats and one-click recalculation.",
+        "Optional Activity Log entries and taxable-fee support.",
+        "Automatically applies fees on invoice creation and payment-method changes.",
+        "Compatible with WHMCS 9.x and PHP 8.1+."
       ]
     },
     "logo": {
