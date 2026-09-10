@@ -388,50 +388,84 @@ add_hook('AdminClientProfileTabFieldsSave', 1, function ($vars) {
 });
 
 /**
- * Display an estimated fee on the checkout page (Twenty-One theme).
- * The JS mirrors the server-side rules (fixed + %, min threshold, max cap,
- * discounts) so the estimate matches what will land on the invoice.
+ * The PayPal Payments (PPCP) gateway module names that create their PayPal
+ * order in-context on the checkout page, before a WHMCS invoice exists.
+ *
+ * @return array
+ */
+function gatewayfees_ppcp_gateways()
+{
+    return ['paypal_ppcpv', 'paypal_acdc'];
+}
+
+/**
+ * Web URL of the PPCP order-patch endpoint.
+ *
+ * @return string
+ */
+function gatewayfees_endpoint_url()
+{
+    $systemUrl = Capsule::table('tblconfiguration')
+        ->where('setting', 'SystemURL')
+        ->value('value');
+
+    return rtrim((string) $systemUrl, '/') . '/modules/addons/gateway_fees/ppcp_patch.php';
+}
+
+/**
+ * Checkout-page output: an optional visual fee estimate (Twenty-One theme) and
+ * an optional PayPal Payments (PPCP) order-total patch.
+ *
+ * The visual estimate mirrors the server-side rules. The PPCP patch (opt-in)
+ * intercepts the in-context PayPal order created before the invoice exists and
+ * asks our server endpoint to add the configured fee to the remote order, so
+ * the amount PayPal authorises matches the invoice total.
  */
 add_hook('ShoppingCartCheckoutOutput', 1, function ($vars) {
-    if (gatewayfees_setting('enable_checkout_hook', 'off') !== 'on') {
-        return '';
-    }
-
     if (!Capsule::schema()->hasTable(GATEWAY_FEES_TABLE)) {
         return '';
     }
 
-    // Current display currency.
-    $currencySymbol = '';
-    if (function_exists('getCurrency')) {
-        $currency = getCurrency();
-        if (!empty($currency['code'])) {
-            $currencySymbol = $currency['code'];
+    $showEstimate = gatewayfees_setting('enable_checkout_hook', 'off') === 'on';
+    $ppcpPatch    = gatewayfees_setting('enable_ppcp_patch', 'off') === 'on';
+
+    if (!$showEstimate && !$ppcpPatch) {
+        return '';
+    }
+
+    $output = '';
+
+    if ($showEstimate) {
+        // Current display currency.
+        $currencySymbol = '';
+        if (function_exists('getCurrency')) {
+            $currency = getCurrency();
+            if (!empty($currency['code'])) {
+                $currencySymbol = $currency['code'];
+            }
         }
-    }
-    if (!$currencySymbol) {
-        $currencySymbol = Capsule::table('tblcurrencies')
-            ->where('default', 1)
-            ->value('code');
-    }
-    $currencySymbol = htmlspecialchars((string) $currencySymbol, ENT_QUOTES);
-    $feeLabel       = htmlspecialchars((string) gatewayfees_setting('fee_label', 'Gateway Fee'), ENT_QUOTES);
+        if (!$currencySymbol) {
+            $currencySymbol = Capsule::table('tblcurrencies')
+                ->where('default', 1)
+                ->value('code');
+        }
+        $currencySymbol = htmlspecialchars((string) $currencySymbol, ENT_QUOTES);
+        $feeLabel       = htmlspecialchars((string) gatewayfees_setting('fee_label', 'Gateway Fee'), ENT_QUOTES);
 
-    // Build the fee map for enabled gateways.
-    $rules = Capsule::table(GATEWAY_FEES_TABLE)->where('enabled', 1)->get();
-    $fees  = [];
-    foreach ($rules as $rule) {
-        $fees[$rule->gateway] = [
-            'fixed'   => (float) $rule->fee_fixed,
-            'percent' => (float) $rule->fee_percent,
-            'min'     => (float) ($rule->min_amount ?? 0),
-            'max'     => (float) ($rule->max_fee ?? 0),
-        ];
-    }
+        // Build the fee map for enabled gateways.
+        $rules = Capsule::table(GATEWAY_FEES_TABLE)->where('enabled', 1)->get();
+        $fees  = [];
+        foreach ($rules as $rule) {
+            $fees[$rule->gateway] = [
+                'fixed'   => (float) $rule->fee_fixed,
+                'percent' => (float) $rule->fee_percent,
+                'min'     => (float) ($rule->min_amount ?? 0),
+                'max'     => (float) ($rule->max_fee ?? 0),
+            ];
+        }
+        $feesJson = json_encode($fees);
 
-    $feesJson = json_encode($fees);
-
-    return <<<EOT
+        $output .= <<<EOT
     <script>
         document.addEventListener('DOMContentLoaded', function () {
             var fees = {$feesJson};
@@ -492,4 +526,85 @@ add_hook('ShoppingCartCheckoutOutput', 1, function ($vars) {
         });
     </script>
     EOT;
+    }
+
+    if ($ppcpPatch) {
+        $endpoint     = htmlspecialchars(gatewayfees_endpoint_url(), ENT_QUOTES);
+        $ppcpGateways = json_encode(array_values(gatewayfees_ppcp_gateways()));
+
+        $output .= <<<EOT
+    <script>
+    (function () {
+        // Opt-in: PayPal Payments (PPCP) creates its order in-context, before a
+        // WHMCS invoice (and its fee) exists. We intercept that order-create
+        // response and ask our server to add the configured fee to the remote
+        // PayPal order. Everything here is best-effort and never blocks checkout.
+        var endpoint = "{$endpoint}";
+        var gateways = {$ppcpGateways};
+
+        function matchGateway(url) {
+            url = url || '';
+            for (var i = 0; i < gateways.length; i++) {
+                if (url.indexOf('/' + gateways[i] + '/order/create') !== -1) { return gateways[i]; }
+            }
+            return null;
+        }
+
+        function patchOrder(orderId, gateway) {
+            if (!orderId || !gateway) { return; }
+            try {
+                var body = 'orderID=' + encodeURIComponent(orderId) + '&gateway=' + encodeURIComponent(gateway);
+                fetch(endpoint, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body
+                }).catch(function () {});
+            } catch (e) {}
+        }
+
+        if (window.fetch) {
+            var origFetch = window.fetch;
+            window.fetch = function () {
+                var args = arguments;
+                var url = (args[0] && args[0].url) ? args[0].url : ('' + args[0]);
+                var gw = matchGateway(url);
+                var p = origFetch.apply(this, args);
+                if (gw) {
+                    p.then(function (resp) {
+                        try {
+                            resp.clone().json().then(function (data) {
+                                if (data && data.id) { patchOrder(data.id, gw); }
+                            }).catch(function () {});
+                        } catch (e) {}
+                    }).catch(function () {});
+                }
+                return p;
+            };
+        }
+
+        try {
+            var oOpen = XMLHttpRequest.prototype.open;
+            var oSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (method, url) { this.__gwUrl = url; return oOpen.apply(this, arguments); };
+            XMLHttpRequest.prototype.send = function () {
+                var self = this;
+                var gw = matchGateway(self.__gwUrl);
+                if (gw) {
+                    self.addEventListener('load', function () {
+                        try {
+                            var data = JSON.parse(self.responseText);
+                            if (data && data.id) { patchOrder(data.id, gw); }
+                        } catch (e) {}
+                    });
+                }
+                return oSend.apply(this, arguments);
+            };
+        } catch (e) {}
+    })();
+    </script>
+    EOT;
+    }
+
+    return $output;
 });

@@ -4,7 +4,7 @@ This WHMCS addon allows you to add fees based on the payment gateway being used.
 
 ## You like this module? [Buy me a Coffee](https://buymeacoffee.com/nikba) ☕︎
 
-> **Version 2.1.1** — Fully compatible with **WHMCS 9.x** and **PHP 8.1+**, with a dedicated admin management interface.
+> **Version 2.2.0** — Fully compatible with **WHMCS 9.x** and **PHP 8.1+**, with a dedicated admin management interface and optional PayPal Payments (PPCP) support.
 
 ## Features
 
@@ -49,6 +49,7 @@ This WHMCS addon allows you to add fees based on the payment gateway being used.
 - **Exempt Client Groups** — comma-separated client group IDs that are never charged a fee.
 - **Log to Activity Log** — write an Activity Log entry each time a fee is applied.
 - **Show Fees on Checkout Page** — display an estimated fee on the checkout page (Twenty-One theme).
+- **Adjust PayPal Payments Order Total (Beta)** — for PayPal Payments (`paypal_ppcpv` / `paypal_acdc`) only. PPCP creates its PayPal order before the invoice exists, so the fee would otherwise not be charged. When enabled, a checkout interceptor asks the server (`ppcp_patch.php`) to patch the PayPal order total to include the fee. The fee is recomputed server-side and API credentials never leave the server. Requires cURL and outbound access to PayPal's API. Disabled by default — test before enabling in production.
 
 **Per-gateway fees** are managed from the addon page under **Addons → Gateway Fees**:
 - **Fixed Fee / Percentage Fee** — use negative values to apply a **discount** instead.
@@ -73,6 +74,10 @@ For support or questions, please open an issue on the GitHub repository.
 ## License
 
 This addon is open-source and licensed under the MIT License.
+
+## Version 2.2.0 - Changelog
+
+- **PayPal Payments (PPCP) support (Beta, opt-in)** — adjusts the PayPal order total to include the fee for `paypal_ppcpv` / `paypal_acdc`, which create their order before the invoice exists (issue #5). Fee is recomputed server-side; credentials stay server-side; disabled by default.
 
 ## Version 2.1.1 - Changelog
 

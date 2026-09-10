@@ -1,3 +1,23 @@
+## Version 2.2.0 - Changelog
+
+### New
+
+- **PayPal Payments (PPCP) support (Beta, opt-in).** PayPal Payments
+  (`paypal_ppcpv` / `paypal_acdc`) creates its PayPal order in-context on the
+  checkout page, before a WHMCS invoice exists — so the invoice-level fee was
+  never charged, leaving an unpaid balance (see issue #5). A new option,
+  **"Adjust PayPal Payments Order Total"**, adds a checkout interceptor that
+  detects the freshly created PayPal order and asks a new server endpoint
+  (`ppcp_patch.php`) to PATCH the remote order total to include the fee.
+  - The fee is recomputed server-side from the PayPal order's own amount — the
+    browser never supplies the fee value.
+  - PayPal API credentials are read server-side from the gateway module and
+    never exposed to the client.
+  - Fail-safe: any error returns JSON and never blocks the PayPal flow.
+  - Disabled by default. Requires cURL and outbound access to PayPal's API.
+
+---
+
 ## Version 2.1.1 - Changelog
 
 ### Fix
