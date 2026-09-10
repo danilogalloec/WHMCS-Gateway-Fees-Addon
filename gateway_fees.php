@@ -22,7 +22,7 @@ if (!defined('WHMCS')) {
 use WHMCS\Database\Capsule;
 use Illuminate\Database\Schema\Blueprint;
 
-const GATEWAY_FEES_VERSION = '2.1.1';
+const GATEWAY_FEES_VERSION = '2.2.0';
 
 if (!defined('GATEWAY_FEES_TABLE')) {
     define('GATEWAY_FEES_TABLE', 'mod_gateway_fees');
@@ -83,6 +83,12 @@ function gateway_fees_config()
                 'Type'         => 'yesno',
                 'Default'      => 'yes',
                 'Description'  => 'Tick to display the estimated fee on the checkout page (Twenty-One theme).',
+            ],
+            'enable_ppcp_patch' => [
+                'FriendlyName' => 'Adjust PayPal Payments Order Total (Beta)',
+                'Type'         => 'yesno',
+                'Default'      => 'no',
+                'Description'  => 'For PayPal Payments (paypal_ppcpv / paypal_acdc) only. PPCP creates its PayPal order before the invoice exists, so the fee would not be charged. Tick to patch the PayPal order total to include the fee at checkout. Requires cURL and outbound access to api-m.paypal.com. Beta — test before enabling in production.',
             ],
         ],
     ];
